@@ -1,0 +1,15 @@
+[package]
+name = "blelog-format"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable BLE Logger record and wire protocol codecs"
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+path = "src/lib.rs"

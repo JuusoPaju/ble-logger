@@ -1,0 +1,31 @@
+[package]
+name = "ble-logger-firmware"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "ble-logger"
+path = "src/main.rs"
+harness = false
+
+[dependencies]
+blelog-format = { path = "../crates/blelog-format", default-features = false }
+crossbeam-channel = "0.5.15"
+esp-idf-svc = { version = "=0.52.1", features = ["critical-section", "embassy-sync"] }
+esp32-nimble = "=0.12.0"
+heapless = "0.8.0"
+log = "0.4"
+anyhow = "1.0.102"
+
+[build-dependencies]
+embuild = "0.33.5"
+
+[package.metadata.esp-idf-sys]
+esp_idf_version = "v5.5.3"
+esp_idf_tools_install_dir = "workspace"
+mcu = "esp32s3"
+esp_idf_sdkconfig_defaults = ["firmware/sdkconfig.defaults"]

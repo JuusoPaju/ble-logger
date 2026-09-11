@@ -1,0 +1,8 @@
+[idf]
+partition_table = "partitions.csv"
+target_app_partition = "factory"
+
+[flash]
+mode = "qio"
+size = "16mb"
+frequency = "80mhz"
