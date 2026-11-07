@@ -17,11 +17,17 @@ use crate::{
 };
 
 const EXT_PROP_SCAN_RESPONSE: u8 = 0x08;
-const SCAN_SLICE_MS: i32 = 1_000;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-pub fn initialize() {
+pub fn initialize() -> Result<()> {
+    // The wrapper erases NVS on init errors. Refuse before entering it so saved
+    // field settings are never silently destroyed by recovery.
+    let rc = unsafe { esp_idf_svc::sys::nvs_flash_init() };
+    if rc != esp_idf_svc::sys::ESP_OK {
+        return Err(FirmwareError::Config(rc));
+    }
     let _ = BLEDevice::take();
+    Ok(())
 }
 
 pub fn run_scan(
@@ -29,6 +35,7 @@ pub fn run_scan(
     sequence: Arc<AtomicU32>,
     session_id: u64,
     settings: StartCapture,
+    duration_ms: u16,
 ) -> Result<()> {
     let result = esp_idf_svc::hal::task::block_on(async {
         let device = BLEDevice::take();
@@ -38,11 +45,11 @@ pub fn run_scan(
             .interval(settings.interval_ms)
             .window(settings.window_ms);
 
-        while !STOP_REQUESTED.load(Ordering::Acquire) {
+        if !STOP_REQUESTED.load(Ordering::Acquire) {
             // ESP-IDF 5.5.3's external discovery cancel clears the callback
             // state without delivering DISC_COMPLETE. BLEScan waits for that
             // event, so bounded public scans provide deterministic shutdown.
-            scan.start(device, SCAN_SLICE_MS, |device, data| {
+            scan.start(device, i32::from(duration_ms), |device, data| {
                 // Sequence and timestamp are assigned before any copying or queue work.
                 let sequence_number = sequence.fetch_add(1, Ordering::Relaxed);
                 let timestamp = monotonic_us();
@@ -125,4 +132,8 @@ pub fn clear_stop_request() {
 
 pub fn request_stop() {
     STOP_REQUESTED.store(true, Ordering::Release);
+}
+
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(Ordering::Acquire)
 }

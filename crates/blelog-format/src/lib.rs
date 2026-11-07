@@ -3,6 +3,7 @@
 
 //! Stable, allocation-free codecs shared by the ESP32-S3 firmware and host CLI.
 
+pub mod capture;
 pub mod crc;
 pub mod record;
 pub mod transport;

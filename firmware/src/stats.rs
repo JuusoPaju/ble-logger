@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use blelog_format::capture::{RadioStats, RADIO_STATS_FIELDS};
 use blelog_format::wire::Stats;
 
 #[derive(Default)]
@@ -11,9 +12,23 @@ pub struct AtomicStats {
     pub flash_errors: AtomicU32,
     pub bytes_written: AtomicU32,
     pub queue_high_water: AtomicU32,
+    pub radio: [AtomicU32; RADIO_STATS_FIELDS],
+    pub active_radio: AtomicU32,
+    pub active_channel: AtomicU32,
 }
 
 impl AtomicStats {
+    pub fn radio_snapshot(&self) -> RadioStats {
+        RadioStats(core::array::from_fn(|i| {
+            u64::from(self.radio[i].load(Ordering::Relaxed))
+                * if (7..=9).contains(&i) { 1000 } else { 1 }
+        }))
+    }
+    pub fn reset_radio(&self) {
+        for value in &self.radio {
+            value.store(0, Ordering::Relaxed);
+        }
+    }
     pub fn snapshot(&self) -> Stats {
         Stats {
             received_observations: u64::from(self.received.load(Ordering::Relaxed)),

@@ -121,6 +121,7 @@ pub struct ClockSync {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record<'a> {
+    Capture(crate::capture::CaptureRecord<'a>),
     SessionStart(SessionStart<'a>),
     BleObservation(BleObservation<'a>),
     SessionEnd(SessionEnd),
@@ -129,6 +130,7 @@ pub enum Record<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodedRecord<'a> {
+    Capture(crate::capture::CaptureRecord<'a>),
     SessionStart(SessionStart<'a>),
     BleObservation(BleObservation<'a>),
     SessionEnd(SessionEnd),
@@ -209,6 +211,7 @@ fn read_i64(input: &[u8], offset: usize) -> i64 {
 
 pub fn encoded_len(record: &Record<'_>) -> Result<usize, RecordError> {
     let (header, payload) = match record {
+        Record::Capture(v) => (14, v.body_len()?),
         Record::SessionStart(v) => {
             if v.firmware_version.len() > MAX_FIRMWARE_VERSION_LEN {
                 return Err(RecordError::FirmwareVersionTooLong);
@@ -240,6 +243,12 @@ pub fn encode_record(record: &Record<'_>, out: &mut [u8]) -> Result<usize, Recor
     write_u32(out, 8, len as u32);
 
     let (record_type, header_len, payload): (u8, usize, &[u8]) = match record {
+        Record::Capture(v) => {
+            let body_len = v.body_len()?;
+            write_u16(out, 12, body_len as u16);
+            v.encode_body(&mut out[14..14 + body_len])?;
+            (v.record_type(), 14, &[])
+        }
         Record::SessionStart(v) => {
             write_u64(out, 12, v.session_id);
             write_u32(out, 20, v.boot_id);
@@ -335,6 +344,20 @@ pub fn decode_record(input: &[u8]) -> Result<Decoded<'_>, RecordError> {
     }
 
     let record = match record_type {
+        5..=8 => {
+            if header_len != 14 {
+                return Err(RecordError::InvalidHeaderLength);
+            }
+            let body_len = usize::from(read_u16(bytes, 12));
+            if header_len + body_len > crc_offset {
+                return Err(RecordError::Truncated);
+            }
+            validate_padding(bytes, header_len + body_len, crc_offset)?;
+            DecodedRecord::Capture(crate::capture::decode_body(
+                record_type,
+                &bytes[14..14 + body_len],
+            )?)
+        }
         TYPE_SESSION_START => {
             if header_len != SESSION_START_HEADER_LEN {
                 return Err(RecordError::InvalidHeaderLength);

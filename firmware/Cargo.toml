@@ -6,10 +6,23 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 build = "build.rs"
+default-run = "ble-logger"
+
+[features]
+# Bounded, UART-observed lifecycle test; never enabled in field builds.
+radio-selftest = []
+# Standalone LED pin probe; does not initialize storage or either radio.
+rgb-probe = []
 
 [[bin]]
 name = "ble-logger"
 path = "src/main.rs"
+harness = false
+
+[[bin]]
+name = "rgb-probe"
+path = "src/rgb_probe.rs"
+required-features = ["rgb-probe"]
 harness = false
 
 [dependencies]

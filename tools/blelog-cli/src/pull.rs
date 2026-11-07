@@ -21,6 +21,8 @@ pub struct PullSummary {
     pub bytes: u64,
     pub records: u64,
     pub observations: u64,
+    pub wifi_frames: u64,
+    pub incomplete_wifi_frames: u64,
 }
 
 pub fn partial_path(output: &Path) -> PathBuf {
@@ -55,6 +57,7 @@ pub fn pull<C: RequestClient>(
 
     let result = (|| -> Result<PullSummary> {
         let mut start_offset = 0u64;
+        let mut resume_prefix = Vec::new();
         if resume && part.exists() {
             let bytes = fs::read(&part).context("failed to read partial download")?;
             let scan = scan_stream(&bytes);
@@ -74,11 +77,24 @@ pub fn pull<C: RequestClient>(
             if start_offset > u64::from(valid_bytes) {
                 bail!("partial file is longer than the device dump");
             }
+            resume_prefix.extend_from_slice(&bytes[..start_offset as usize]);
         } else if part.exists() {
             bail!(
                 "{} already exists; pass --resume or remove it",
                 part.display()
             );
+        }
+
+        // A valid CRC prefix can belong to a different capture/device. Compare it
+        // against this frozen dump before trimming or appending anything locally.
+        let mut checked = 0usize;
+        while checked < resume_prefix.len() {
+            let requested = usize::from(chunk_size).min(resume_prefix.len() - checked) as u16;
+            let bytes = request_chunk(client, transfer_id, checked as u32, requested)?;
+            if bytes != resume_prefix[checked..checked + bytes.len()] {
+                bail!("partial file does not match this device dump at byte {checked}");
+            }
+            checked += bytes.len();
         }
 
         let mut file = OpenOptions::new()
@@ -93,31 +109,7 @@ pub fn pull<C: RequestClient>(
         let mut offset = start_offset as u32;
         while offset < valid_bytes {
             let requested = u32::from(chunk_size).min(valid_bytes - offset) as u16;
-            let mut request = [0u8; 10];
-            encode_dump_read_request(transfer_id, offset, requested, &mut request)?;
-            let mut last_error = None;
-            let mut received = None;
-            for _ in 0..3 {
-                match client.request(message::DUMP_READ, &request) {
-                    Ok(response) => match decode_dump_read_response(&response) {
-                        Ok((got_transfer, got_offset, bytes))
-                            if got_transfer == transfer_id
-                                && got_offset == offset
-                                && !bytes.is_empty()
-                                && bytes.len() <= usize::from(requested) =>
-                        {
-                            received = Some(bytes.to_vec());
-                            break;
-                        }
-                        Ok(_) => last_error = Some(anyhow::anyhow!("mismatched dump chunk")),
-                        Err(error) => last_error = Some(error.into()),
-                    },
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            let bytes = received.ok_or_else(|| {
-                last_error.unwrap_or_else(|| anyhow::anyhow!("empty dump response"))
-            })?;
+            let bytes = request_chunk(client, transfer_id, offset, requested)?;
             file.write_all(&bytes)?;
             offset += bytes.len() as u32;
         }
@@ -125,6 +117,7 @@ pub fn pull<C: RequestClient>(
         drop(file);
 
         let scan = verify_file(&part).context("downloaded record stream failed verification")?;
+        let wifi = crate::verify::analyze_wifi(&fs::read(&part)?)?;
         if scan.valid_bytes != valid_bytes as usize || scan.record_count != expected_records {
             bail!(
                 "dump changed or was incomplete: device reported {valid_bytes} bytes/{expected_records} records, got {}/{}",
@@ -140,6 +133,8 @@ pub fn pull<C: RequestClient>(
             bytes: valid_bytes as u64,
             records: scan.record_count,
             observations: scan.observation_count,
+            wifi_frames: wifi.frames,
+            incomplete_wifi_frames: wifi.incomplete,
         })
     })();
 
@@ -151,4 +146,33 @@ pub fn pull<C: RequestClient>(
         (Ok(_), Err(error)) => Err(error).context("download succeeded but DUMP_END failed"),
         (Err(error), _) => Err(error),
     }
+}
+
+fn request_chunk(
+    client: &mut impl RequestClient,
+    transfer_id: u32,
+    offset: u32,
+    requested: u16,
+) -> Result<Vec<u8>> {
+    let mut request = [0; 10];
+    encode_dump_read_request(transfer_id, offset, requested, &mut request)?;
+    let mut last_error = anyhow::anyhow!("empty dump response");
+    for _ in 0..3 {
+        match client.request(message::DUMP_READ, &request) {
+            Ok(response) => match decode_dump_read_response(&response) {
+                Ok((transfer, position, bytes))
+                    if transfer == transfer_id
+                        && position == offset
+                        && !bytes.is_empty()
+                        && bytes.len() <= usize::from(requested) =>
+                {
+                    return Ok(bytes.to_vec())
+                }
+                Ok(_) => last_error = anyhow::anyhow!("mismatched dump chunk"),
+                Err(error) => last_error = error.into(),
+            },
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }

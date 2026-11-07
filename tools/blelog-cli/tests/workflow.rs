@@ -142,6 +142,24 @@ fn resume_refuses_crc_corruption() {
 }
 
 #[test]
+fn resume_refuses_a_valid_prefix_from_a_different_capture() {
+    let log = sample_log();
+    let first = blelog_format::decode_record(&log).unwrap().total_len;
+    let mut different = log.clone();
+    different[20] ^= 1;
+    let crc = blelog_format::crc::crc32(&different[..first - 4]);
+    different[first - 4..first].copy_from_slice(&crc.to_le_bytes());
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("walk.blelog");
+    let part = partial_path(&output);
+    fs::write(&part, &log[..first]).unwrap();
+    let error = pull(&mut FakeDevice::new(different), &output, true, 128).unwrap_err();
+    assert!(error.to_string().contains("does not match"));
+    assert_eq!(fs::read(part).unwrap(), log[..first]);
+    assert!(!output.exists());
+}
+
+#[test]
 fn jsonl_and_csv_exports_have_the_verified_observation_count() {
     let log = sample_log();
     let directory = tempfile::tempdir().unwrap();

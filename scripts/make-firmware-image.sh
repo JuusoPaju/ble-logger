@@ -35,7 +35,7 @@ fi
 image_tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$image_tmp_dir"' EXIT
 partition_bin="$image_tmp_dir/partition-table.bin"
-app_bin="$image_tmp_dir/application.bin"
+app_bin="$artifact_dir/ble-logger-app.bin"
 
 "$esp_python" "$idf_dir/components/partition_table/gen_esp32part.py" \
     "$workspace_dir/partitions.csv" "$partition_bin"

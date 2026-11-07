@@ -73,6 +73,25 @@ impl Drop for UsbSerialJtag {
 }
 
 pub fn run(mut usb: UsbSerialJtag, controller: &mut Controller) -> ! {
+    run_with(&mut usb, |command, payload| {
+        dispatch(controller, command, payload)
+    })
+}
+
+pub fn run_error(mut usb: UsbSerialJtag, error: FirmwareError) -> ! {
+    run_with(&mut usb, |command, payload| {
+        if command == message::PING && payload.is_empty() {
+            (Status::Ok, b"BLELOG1".to_vec())
+        } else {
+            (
+                Status::Io,
+                format!("startup failed: {error}; reset after resolving the fault").into_bytes(),
+            )
+        }
+    })
+}
+
+fn run_with(usb: &mut UsbSerialJtag, mut handle: impl FnMut(u8, &[u8]) -> (Status, Vec<u8>)) -> ! {
     let mut encoded_input = Vec::with_capacity(MAX_ENCODED_FRAME_LEN);
     let mut read_buffer = [0u8; 128];
     let mut decoded = vec![0u8; MAX_DECODED_FRAME_LEN];
@@ -105,7 +124,7 @@ pub fn run(mut usb: UsbSerialJtag, controller: &mut Controller) -> ! {
             let Ok(frame) = frame else {
                 continue;
             };
-            let (status, detail) = dispatch(controller, frame.message_type, frame.payload);
+            let (status, detail) = handle(frame.message_type, frame.payload);
             let mut response_payload = vec![0u8; detail.len() + 2];
             let payload_len = encode_status(status, &detail, &mut response_payload).unwrap();
             let response = Frame {
@@ -133,6 +152,57 @@ fn dispatch_inner(
     payload: &[u8],
 ) -> Result<Vec<u8>, FirmwareError> {
     match command {
+        message::CAPABILITIES => {
+            require_empty(payload)?;
+            Ok(b"DUAL1".to_vec())
+        }
+        message::START_RADIOS => {
+            let config = blelog_format::capture::CaptureConfig::decode(payload)
+                .map_err(|_| FirmwareError::Bounds)?;
+            controller.start_radios(config)?;
+            Ok(Vec::new())
+        }
+        message::SAVE_CONFIG => {
+            let config = blelog_format::capture::CaptureConfig::decode(payload)
+                .map_err(|_| FirmwareError::Bounds)?;
+            controller.save_config(config)?;
+            Ok(Vec::new())
+        }
+        message::BOOT_CONFIG | message::RADIO_INFO => {
+            require_empty(payload)?;
+            let mut bytes = vec![0; blelog_format::capture::CONFIG_LEN];
+            let config = if command == message::BOOT_CONFIG {
+                controller.boot_config
+            } else {
+                controller.capture_config
+            };
+            config
+                .encode(&mut bytes)
+                .map_err(|_| FirmwareError::Bounds)?;
+            Ok(bytes)
+        }
+        message::RADIO_STATS => {
+            require_empty(payload)?;
+            let mut bytes = vec![0; blelog_format::capture::RADIO_STATS_LEN + 2];
+            controller
+                .storage
+                .stats
+                .radio_snapshot()
+                .encode(&mut bytes)
+                .map_err(|_| FirmwareError::Bounds)?;
+            let len = blelog_format::capture::RADIO_STATS_LEN;
+            bytes[len] = controller
+                .storage
+                .stats
+                .active_radio
+                .load(core::sync::atomic::Ordering::Relaxed) as u8;
+            bytes[len + 1] = controller
+                .storage
+                .stats
+                .active_channel
+                .load(core::sync::atomic::Ordering::Relaxed) as u8;
+            Ok(bytes)
+        }
         message::PING => {
             require_empty(payload)?;
             Ok(b"BLELOG1".to_vec())

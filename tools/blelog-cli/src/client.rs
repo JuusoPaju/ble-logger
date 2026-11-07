@@ -14,6 +14,30 @@ pub trait RequestClient {
     fn request(&mut self, message_type: u8, payload: &[u8]) -> Result<Vec<u8>>;
 }
 
+#[derive(Debug)]
+pub struct DeviceStatus(pub Status, pub String);
+impl core::fmt::Display for DeviceStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "device returned {:?}: {}", self.0, self.1)
+    }
+}
+impl std::error::Error for DeviceStatus {}
+
+pub fn supports_dual(client: &mut impl RequestClient) -> Result<bool> {
+    match client.request(blelog_format::transport::message::CAPABILITIES, &[]) {
+        Ok(bytes) if bytes == b"DUAL1" => Ok(true),
+        Ok(_) => bail!("unsupported capability response"),
+        Err(error)
+            if error.downcast_ref::<DeviceStatus>().is_some_and(|e| {
+                matches!(e.0, Status::UnknownCommand | Status::UnsupportedVersion)
+            }) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub struct SerialClient {
     port: Box<dyn serialport::SerialPort>,
     next_request_id: u16,
@@ -73,7 +97,7 @@ impl SerialClient {
                     let (status, detail) = decode_status(frame.payload)?;
                     if status != Status::Ok {
                         let explanation = String::from_utf8_lossy(detail);
-                        bail!("device returned {status:?}: {explanation}");
+                        return Err(DeviceStatus(status, explanation.into_owned()).into());
                     }
                     return Ok(detail.to_vec());
                 }

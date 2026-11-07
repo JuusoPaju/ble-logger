@@ -16,6 +16,8 @@ pub enum FirmwareError {
     QueueClosed,
     Usb(i32),
     Ble,
+    Wifi(i32),
+    Config(i32),
 }
 
 impl From<blelog_format::RecordError> for FirmwareError {

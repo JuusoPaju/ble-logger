@@ -20,6 +20,12 @@ pub mod message {
     pub const DUMP_READ: u8 = 0x08;
     pub const DUMP_END: u8 = 0x09;
     pub const ERASE_LOG: u8 = 0x0A;
+    pub const CAPABILITIES: u8 = 0x0B;
+    pub const START_RADIOS: u8 = 0x0C;
+    pub const RADIO_INFO: u8 = 0x0D;
+    pub const RADIO_STATS: u8 = 0x0E;
+    pub const SAVE_CONFIG: u8 = 0x0F;
+    pub const BOOT_CONFIG: u8 = 0x10;
     pub const RESPONSE_BIT: u8 = 0x80;
 }
 

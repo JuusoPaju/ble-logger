@@ -1,12 +1,14 @@
 use std::{
     sync::{
         atomic::{AtomicU32, Ordering},
+        mpsc::{self, Receiver, SyncSender},
         Arc,
     },
-    thread::{self, JoinHandle},
+    thread,
 };
 
 use blelog_format::{
+    capture::{CaptureConfig, Radios},
     record::{ClockSync, ScanMode, SessionStart},
     wire::{LoggerState, StartCapture, MAX_SCAN_MS},
 };
@@ -24,33 +26,82 @@ pub const FIELD_DEFAULTS: StartCapture = StartCapture {
     interval_ms: 100,
     window_ms: 100,
 };
+#[cfg(not(feature = "radio-selftest"))]
 pub const AUTOSTART_CAPTURE: bool = true;
+
+struct ScanRequest {
+    session_id: u64,
+    config: CaptureConfig,
+    seed: u32,
+    done: SyncSender<()>,
+}
 
 pub struct Controller {
     pub storage: StorageService,
     pub hardware: HardwareInfo,
     pub boot_id: u32,
     pub scan_settings: StartCapture,
+    pub capture_config: CaptureConfig,
+    pub boot_config: CaptureConfig,
     clock: ClockState,
     sequence: Arc<AtomicU32>,
     session_id: u64,
-    scanner: Option<JoinHandle<()>>,
+    scanner: Option<Receiver<()>>,
+    worker: SyncSender<ScanRequest>,
 }
 
 impl Controller {
-    pub fn new(storage: StorageService, hardware: HardwareInfo) -> Self {
-        Self {
+    pub fn new(storage: StorageService, hardware: HardwareInfo) -> Result<Self> {
+        let boot_config = crate::radio::load_config().unwrap_or_else(|error| {
+            log::warn!("invalid boot capture config: {error}; using defaults");
+            CaptureConfig::default()
+        });
+        // Reserve the internal stack once, before Wi-Fi initialization fragments
+        // the remaining heap. STOP waits for a session, not task destruction.
+        let sequence = Arc::new(AtomicU32::new(0));
+        let worker_sequence = sequence.clone();
+        let worker_storage = storage.clone();
+        let (worker, requests) = mpsc::sync_channel::<ScanRequest>(1);
+        thread::Builder::new()
+            .name("radio-scanner".into())
+            .stack_size(16 * 1024)
+            .spawn(move || {
+                while let Ok(request) = requests.recv() {
+                    let _ = crate::radio::run(
+                        worker_storage.clone(),
+                        worker_sequence.clone(),
+                        request.session_id,
+                        request.config,
+                        request.seed,
+                    );
+                    let _ = worker_storage.finish_session(request.session_id, monotonic_us());
+                    #[cfg(feature = "radio-selftest")]
+                    log::info!(
+                        "SELFTEST scanner minimum stack remaining: {} bytes",
+                        unsafe {
+                            esp_idf_svc::sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut())
+                        }
+                    );
+                    let _ = request.done.send(());
+                }
+            })
+            .map_err(|_| FirmwareError::QueueClosed)?;
+        Ok(Self {
             storage,
             hardware,
             boot_id: unsafe { esp_idf_svc::sys::esp_random() },
             scan_settings: FIELD_DEFAULTS,
+            capture_config: boot_config,
+            boot_config,
             clock: ClockState::default(),
-            sequence: Arc::new(AtomicU32::new(0)),
+            sequence,
             session_id: 0,
             scanner: None,
-        }
+            worker,
+        })
     }
 
+    #[cfg(not(feature = "radio-selftest"))]
     pub fn autostart(&mut self) {
         let Ok(snapshot) = self.storage.snapshot() else {
             return;
@@ -59,13 +110,41 @@ impl Controller {
             && snapshot.state == LoggerState::Ready
             && snapshot.free_bytes() >= 1024
         {
-            if let Err(error) = self.start_capture(FIELD_DEFAULTS) {
+            if let Err(error) = self.start_radios(self.boot_config) {
                 log::error!("capture autostart failed: {error}");
             }
         }
     }
 
     pub fn start_capture(&mut self, settings: StartCapture) -> Result<()> {
+        self.start_radios(CaptureConfig {
+            radios: Radios::Ble,
+            ble: settings,
+            ..CaptureConfig::default()
+        })
+    }
+
+    pub fn save_config(&mut self, config: CaptureConfig) -> Result<()> {
+        if self.scanner.is_some()
+            || !matches!(
+                self.storage.state(),
+                LoggerState::Ready | LoggerState::Full | LoggerState::CorruptTail
+            )
+        {
+            return Err(FirmwareError::InvalidState);
+        }
+        config.validate().map_err(|_| FirmwareError::Bounds)?;
+        if config.radios != Radios::Ble {
+            crate::wifi::configure(&self.storage, config)?;
+        }
+        crate::radio::save_config(config)?;
+        self.boot_config = config;
+        Ok(())
+    }
+
+    pub fn start_radios(&mut self, mut config: CaptureConfig) -> Result<()> {
+        config.validate().map_err(|_| FirmwareError::Bounds)?;
+        let settings = config.ble;
         if self.scanner.is_some() || self.storage.state() != LoggerState::Ready {
             return Err(FirmwareError::InvalidState);
         }
@@ -75,6 +154,9 @@ impl Controller {
             || settings.window_ms > settings.interval_ms
         {
             return Err(FirmwareError::Bounds);
+        }
+        if config.radios != Radios::Ble {
+            config = crate::wifi::configure(&self.storage, config)?;
         }
         let session_id = (u64::from(unsafe { esp_idf_svc::sys::esp_random() }) << 32)
             | u64::from(unsafe { esp_idf_svc::sys::esp_random() });
@@ -92,24 +174,27 @@ impl Controller {
             extended_adv_enabled: true,
             firmware_version: env!("CARGO_PKG_VERSION").as_bytes(),
         };
+        self.storage.stats.reset_radio();
         self.storage.begin_session(start)?;
+        let seed = unsafe { esp_idf_svc::sys::esp_random() };
+        if let Err(error) = self.storage.configure_session(session_id, seed, config) {
+            let _ = self.storage.finish_session(session_id, monotonic_us());
+            return Err(error);
+        }
         ble::clear_stop_request();
         self.sequence.store(0, Ordering::Relaxed);
         self.session_id = session_id;
         self.scan_settings = settings;
-        let storage = self.storage.clone();
-        let sequence = Arc::clone(&self.sequence);
-        match thread::Builder::new()
-            .name("ble-scanner".into())
-            .stack_size(16 * 1024)
-            .spawn(move || {
-                let _ = ble::run_scan(storage.clone(), sequence, session_id, settings);
-                // This also closes sessions stopped by FULL or a storage-triggered
-                // cancellation. The control-path finish call is idempotent.
-                let _ = storage.finish_session(session_id, monotonic_us());
-            }) {
-            Ok(handle) => {
-                self.scanner = Some(handle);
+        self.capture_config = config;
+        let (done, finished) = mpsc::sync_channel(1);
+        match self.worker.send(ScanRequest {
+            session_id,
+            config,
+            seed,
+            done,
+        }) {
+            Ok(()) => {
+                self.scanner = Some(finished);
                 Ok(())
             }
             Err(_) => {
@@ -136,7 +221,8 @@ impl Controller {
             self.storage.set_state(LoggerState::Stopping);
         }
         ble::request_stop();
-        let _ = scanner.join(); // callback is complete when the dedicated task exits
+        scanner.recv().map_err(|_| FirmwareError::QueueClosed)?;
+        // The worker has stopped both radios and drained their callbacks/queues.
         let session_id = self.session_id;
         self.session_id = 0;
         self.storage.finish_session(session_id, monotonic_us())

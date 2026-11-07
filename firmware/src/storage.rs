@@ -9,6 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::queue::{InternalBuffer, InternalQueue};
+use blelog_format::capture::{
+    CaptureConfig, CaptureRecord, WifiFragment, WifiMeta, FRAGMENT_LEN, WIFI_MAX_LEN,
+};
 use blelog_format::{
     decode_record, encode_record,
     record::{
@@ -17,7 +21,7 @@ use blelog_format::{
     },
     wire::{LoggerState, MAX_DUMP_CHUNK},
 };
-use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use esp_idf_svc::sys;
 use heapless::Vec as HeaplessVec;
 
@@ -27,9 +31,16 @@ use crate::{
 };
 
 const RECOVERY_READ_SIZE: usize = 32 * 1024;
-const OBSERVATION_QUEUE_CAPACITY: usize = 256;
+const OBSERVATION_QUEUE_CAPACITY: usize = 128;
+const WIFI_QUEUE_CAPACITY: usize = 8;
 const DUMP_LEASE: Duration = Duration::from_secs(30);
 const PARTITION_LABEL: &str = "blelog";
+
+#[derive(Clone, Copy)]
+pub struct QueuedWifi {
+    pub meta: WifiMeta,
+    pub payload: [u8; WIFI_MAX_LEN],
+}
 
 #[derive(Debug)]
 pub struct QueuedObservation {
@@ -99,6 +110,7 @@ struct SessionBaseline {
 }
 
 enum Command {
+    Capture(CaptureRecord<'static>, SyncSender<Result<()>>),
     Snapshot(SyncSender<Result<StorageSnapshot>>),
     BeginSession(SessionStart<'static>, SyncSender<Result<()>>),
     FinishSession {
@@ -120,7 +132,8 @@ enum Command {
 
 #[derive(Clone)]
 pub struct StorageService {
-    observations: Sender<QueuedObservation>,
+    observations: Arc<InternalQueue<QueuedObservation>>,
+    pub wifi: Arc<InternalQueue<QueuedWifi>>,
     commands: Sender<Command>,
     pub stats: Arc<AtomicStats>,
     state: Arc<AtomicU8>,
@@ -128,22 +141,37 @@ pub struct StorageService {
 
 impl StorageService {
     pub fn start(stats: Arc<AtomicStats>, state: Arc<AtomicU8>) -> Result<Self> {
-        let (observations, observation_rx) = bounded(OBSERVATION_QUEUE_CAPACITY);
+        crate::diagnostic("allocating queues");
+        let observations = Arc::new(InternalQueue::new(OBSERVATION_QUEUE_CAPACITY)?);
+        let observation_rx = observations.clone();
+        let wifi = Arc::new(InternalQueue::new(WIFI_QUEUE_CAPACITY)?);
+        let wifi_rx = wifi.clone();
+        let wifi_scratch = InternalBuffer::<QueuedWifi>::new()?;
+        crate::diagnostic("queues allocated");
         let (commands, command_rx) = unbounded();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker_stats = Arc::clone(&stats);
         let worker_state = Arc::clone(&state);
         thread::Builder::new()
             .name("blelog-storage".into())
-            .stack_size(64 * 1024)
+            .stack_size(24 * 1024)
             .spawn(move || {
+                crate::diagnostic("storage worker running");
                 worker_state.store(LoggerState::Recovering as u8, Ordering::Release);
                 match FlashLog::open_and_recover() {
                     Ok(log) => {
                         let recovered_state = log.recovered_state;
                         worker_state.store(recovered_state as u8, Ordering::Release);
                         let _ = ready_tx.send(Ok(log.snapshot(recovered_state)));
-                        storage_loop(log, observation_rx, command_rx, worker_stats, worker_state);
+                        storage_loop(
+                            log,
+                            observation_rx,
+                            wifi_rx,
+                            command_rx,
+                            worker_stats,
+                            worker_state,
+                            wifi_scratch,
+                        );
                     }
                     Err(error) => {
                         worker_state.store(LoggerState::Error as u8, Ordering::Release);
@@ -155,6 +183,7 @@ impl StorageService {
         ready_rx.recv().map_err(|_| FirmwareError::QueueClosed)??;
         Ok(Self {
             observations,
+            wifi,
             commands,
             stats,
             state,
@@ -183,17 +212,31 @@ impl StorageService {
         }
         match self.observations.try_send(observation) {
             Ok(()) => self.stats.observe_queue_depth(self.observations.len()),
-            Err(TrySendError::Full(_)) => {
+            Err(_) => {
                 self.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.stats.flash_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
     pub fn snapshot(&self) -> Result<StorageSnapshot> {
         self.call(Command::Snapshot)
+    }
+
+    pub fn capture_record(&self, record: CaptureRecord<'static>) -> Result<()> {
+        self.call(|reply| Command::Capture(record, reply))
+    }
+
+    pub fn configure_session(
+        &self,
+        session_id: u64,
+        seed: u32,
+        config: CaptureConfig,
+    ) -> Result<()> {
+        self.capture_record(CaptureRecord::Config {
+            session_id,
+            seed,
+            config,
+        })
     }
 
     pub fn begin_session(&self, start: SessionStart<'static>) -> Result<()> {
@@ -251,24 +294,55 @@ struct DumpLeaseState {
 
 fn storage_loop(
     mut log: FlashLog,
-    observations: Receiver<QueuedObservation>,
+    observations: Arc<InternalQueue<QueuedObservation>>,
+    wifi: Arc<InternalQueue<QueuedWifi>>,
     commands: Receiver<Command>,
     stats: Arc<AtomicStats>,
     state: Arc<AtomicU8>,
+    mut wifi_scratch: InternalBuffer<QueuedWifi>,
 ) {
     let mut session: Option<SessionBaseline> = None;
     let mut lease: Option<DumpLeaseState> = None;
     loop {
-        select! {
-            recv(commands) -> command => match command {
-                Ok(command) => handle_command(command, &mut log, &observations, &stats, &state, &mut session, &mut lease),
-                Err(_) => break,
-            },
-            recv(observations) -> observation => match observation {
-                Ok(observation) => store_observation(&mut log, observation, &stats, &state),
-                Err(_) => break,
-            },
-            default(Duration::from_millis(250)) => {}
+        let mut work = false;
+        if let Ok(command) = commands.try_recv() {
+            handle_command(
+                command,
+                &mut log,
+                &observations,
+                &wifi,
+                &stats,
+                &state,
+                &mut session,
+                &mut lease,
+                &mut wifi_scratch,
+            );
+            work = true;
+        }
+        if let Ok(observation) = observations.try_recv() {
+            store_observation(&mut log, observation, &stats, &state);
+            work = true;
+        }
+        if let Some(frame) = wifi.try_recv_copy(&mut wifi_scratch) {
+            store_wifi(&mut log, frame, &stats, &state);
+            work = true;
+        }
+        if !work {
+            match commands.recv_timeout(Duration::from_millis(1)) {
+                Ok(command) => handle_command(
+                    command,
+                    &mut log,
+                    &observations,
+                    &wifi,
+                    &stats,
+                    &state,
+                    &mut session,
+                    &mut lease,
+                    &mut wifi_scratch,
+                ),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(_) => {}
+            }
         }
         if lease
             .as_ref()
@@ -284,13 +358,24 @@ fn storage_loop(
 fn handle_command(
     command: Command,
     log: &mut FlashLog,
-    observations: &Receiver<QueuedObservation>,
+    observations: &InternalQueue<QueuedObservation>,
+    wifi: &InternalQueue<QueuedWifi>,
     stats: &AtomicStats,
     state: &AtomicU8,
     session: &mut Option<SessionBaseline>,
     lease: &mut Option<DumpLeaseState>,
+    wifi_scratch: &mut InternalBuffer<QueuedWifi>,
 ) {
     match command {
+        Command::Capture(record, reply) => {
+            let result = if current_state(state) == LoggerState::Capturing {
+                append_with_error_accounting(log, &Record::Capture(record), true, stats, state)
+                    .map(|_| ())
+            } else {
+                Err(FirmwareError::InvalidState)
+            };
+            let _ = reply.send(result);
+        }
         Command::Snapshot(reply) => {
             let _ = reply.send(Ok(log.snapshot(current_state(state))));
         }
@@ -322,6 +407,9 @@ fn handle_command(
             while let Ok(observation) = observations.try_recv() {
                 store_observation(log, observation, stats, state);
             }
+            while let Some(frame) = wifi.try_recv_copy(wifi_scratch) {
+                store_wifi(log, frame, stats, state);
+            }
             let result = if let Some(baseline) = session.take() {
                 if baseline.session_id != session_id {
                     Err(FirmwareError::InvalidState)
@@ -346,7 +434,20 @@ fn handle_command(
                             .flash_write_errors
                             .saturating_sub(baseline.flash_errors),
                     };
-                    append_with_error_accounting(log, &Record::SessionEnd(end), false, stats, state)
+                    let extra = CaptureRecord::Stats {
+                        session_id,
+                        stats: stats.radio_snapshot(),
+                    };
+                    append_with_error_accounting(log, &Record::Capture(extra), false, stats, state)
+                        .and_then(|_| {
+                            append_with_error_accounting(
+                                log,
+                                &Record::SessionEnd(end),
+                                false,
+                                stats,
+                                state,
+                            )
+                        })
                         .map(|_| ())
                 }
             } else {
@@ -360,6 +461,11 @@ fn handle_command(
                 };
                 state.store(next as u8, Ordering::Release);
             }
+            #[cfg(feature = "radio-selftest")]
+            log::info!(
+                "SELFTEST storage minimum stack remaining: {} bytes",
+                unsafe { sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) }
+            );
             let _ = reply.send(result);
         }
         Command::ClockSync(sync, reply) => {
@@ -477,9 +583,7 @@ fn store_observation(
     match append_with_error_accounting(log, &observation.as_record(), true, stats, state) {
         Ok(bytes) => {
             stats.stored.fetch_add(1, Ordering::Relaxed);
-            stats
-                .bytes_written
-                .fetch_add(bytes as u32, Ordering::Relaxed);
+            let _ = bytes;
         }
         Err(FirmwareError::Full) => {
             stats.full_drops.fetch_add(1, Ordering::Relaxed);
@@ -494,6 +598,59 @@ fn store_observation(
     }
 }
 
+fn store_wifi(log: &mut FlashLog, frame: &QueuedWifi, stats: &AtomicStats, state: &AtomicU8) {
+    let state_now = current_state(state);
+    if state_now == LoggerState::Error {
+        stats.radio[4].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if log.full {
+        stats.radio[3].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let payload = &frame.payload[..frame.meta.captured_len as usize];
+    let fragments = payload.len().max(1).div_ceil(FRAGMENT_LEN);
+    let mut required = 0;
+    for i in 0..fragments {
+        let start = i * FRAGMENT_LEN;
+        let end = (start + FRAGMENT_LEN).min(payload.len());
+        let record = Record::Capture(CaptureRecord::Wifi(WifiFragment {
+            meta: frame.meta,
+            offset: start as u16,
+            bytes: &payload[start..end],
+        }));
+        match encoded_len(&record) {
+            Ok(n) => required += n,
+            Err(_) => {
+                stats.radio[5].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    if log.append_offset + required + SESSION_END_MAX_LEN > log.partition_size {
+        log.full = true;
+        state.store(LoggerState::Full as u8, Ordering::Release);
+        stats.radio[3].fetch_add(1, Ordering::Relaxed);
+        crate::ble::request_stop();
+        return;
+    }
+    for i in 0..fragments {
+        let start = i * FRAGMENT_LEN;
+        let end = (start + FRAGMENT_LEN).min(payload.len());
+        let record = Record::Capture(CaptureRecord::Wifi(WifiFragment {
+            meta: frame.meta,
+            offset: start as u16,
+            bytes: &payload[start..end],
+        }));
+        if append_with_error_accounting(log, &record, true, stats, state).is_err() {
+            stats.radio[4].fetch_add(1, Ordering::Relaxed);
+            crate::ble::request_stop();
+            return;
+        }
+    }
+    stats.radio[1].fetch_add(1, Ordering::Relaxed);
+}
+
 fn append_with_error_accounting(
     log: &mut FlashLog,
     record: &Record<'_>,
@@ -501,8 +658,17 @@ fn append_with_error_accounting(
     stats: &AtomicStats,
     state: &AtomicU8,
 ) -> Result<usize> {
-    match log.append(record, reserve_end) {
-        Ok(len) => Ok(len),
+    let started = crate::clock::monotonic_us();
+    let result = log.append(record, reserve_end);
+    stats.radio[11].fetch_max(
+        (crate::clock::monotonic_us() - started).min(u32::MAX as u64) as u32,
+        Ordering::Relaxed,
+    );
+    match result {
+        Ok(len) => {
+            stats.bytes_written.fetch_add(len as u32, Ordering::Relaxed);
+            Ok(len)
+        }
         Err(error @ (FirmwareError::FlashWrite(_) | FirmwareError::Record(_))) => {
             stats.flash_errors.fetch_add(1, Ordering::Relaxed);
             state.store(LoggerState::Error as u8, Ordering::Release);
@@ -572,7 +738,29 @@ impl FlashLog {
     }
 
     fn recover(&mut self) -> Result<()> {
-        let mut chunk = [0u8; RECOVERY_READ_SIZE];
+        // Recovery's large buffer is temporary; keep the worker stack small for
+        // the rest of the capture and return this internal RAM before radio init.
+        struct RecoveryBuffer(*mut u8);
+        impl Drop for RecoveryBuffer {
+            fn drop(&mut self) {
+                unsafe {
+                    sys::heap_caps_free(self.0.cast());
+                }
+            }
+        }
+        let allocation = RecoveryBuffer(
+            unsafe {
+                sys::heap_caps_malloc(
+                    RECOVERY_READ_SIZE,
+                    sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT,
+                )
+            }
+            .cast(),
+        );
+        if allocation.0.is_null() {
+            return Err(FirmwareError::QueueClosed);
+        }
+        let chunk = unsafe { core::slice::from_raw_parts_mut(allocation.0, RECOVERY_READ_SIZE) };
         let mut record = [0u8; MAX_RECORD_LEN];
         let mut offset = 0usize;
         while offset < self.partition_size {
@@ -582,7 +770,7 @@ impl FlashLog {
             while local < read_len {
                 let absolute = offset + local;
                 if chunk[local] == 0xFF {
-                    if self.is_erased_from(absolute, &mut chunk)? {
+                    if self.is_erased_from(absolute, chunk)? {
                         self.append_offset = absolute;
                         self.recovered_state = LoggerState::Ready;
                         return Ok(());
@@ -628,11 +816,7 @@ impl FlashLog {
         Ok(())
     }
 
-    fn is_erased_from(
-        &self,
-        mut offset: usize,
-        scratch: &mut [u8; RECOVERY_READ_SIZE],
-    ) -> Result<bool> {
+    fn is_erased_from(&self, mut offset: usize, scratch: &mut [u8]) -> Result<bool> {
         while offset < self.partition_size {
             let len = scratch.len().min(self.partition_size - offset);
             self.read(offset, &mut scratch[..len])?;
@@ -658,8 +842,14 @@ impl FlashLog {
         let encoded = encode_record(record, &mut scratch)?;
         debug_assert_eq!(encoded, len);
         // Phase one: body through CRC. Phase two: magic commit marker.
-        self.write(self.append_offset + MAGIC.len(), &scratch[MAGIC.len()..len])?;
-        self.write(self.append_offset, &scratch[..MAGIC.len()])?;
+        let written = self
+            .write(self.append_offset + MAGIC.len(), &scratch[MAGIC.len()..len])
+            .and_then(|_| self.write(self.append_offset, &scratch[..MAGIC.len()]));
+        if let Err(error) = written {
+            // Never attempt an end record over a possibly programmed partial body.
+            self.recovered_state = LoggerState::CorruptTail;
+            return Err(error);
+        }
         self.append_offset += len;
         self.record_count += 1;
         Ok(len)
@@ -734,7 +924,8 @@ impl FlashLog {
     }
 }
 
-const SESSION_END_MAX_LEN: usize = 72;
+// CaptureStats (124) + legacy SessionEnd (72). Reserved for every append.
+const SESSION_END_MAX_LEN: usize = 196;
 
 const _: () = {
     assert!(ENVELOPE_LEN + CRC_LEN <= MAX_RECORD_LEN);

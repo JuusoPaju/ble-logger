@@ -9,6 +9,12 @@ before="${BLELOG_BEFORE:-usb-reset}"
 
 "$workspace_dir/scripts/make-firmware-image.sh" "$elf_path" "$image_path"
 
+# Updating an already provisioned board can preserve NVS as well as its log.
+if [[ "${BLELOG_APP_ONLY:-0}" == "1" ]]; then
+    exec espflash write-bin --skip-update-check --chip esp32s3 --port "$port" \
+        --before "$before" 0x10000 "$(dirname "$elf_path")/ble-logger-app.bin"
+fi
+
 exec espflash write-bin \
     --skip-update-check \
     --chip esp32s3 \
